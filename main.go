@@ -19,16 +19,25 @@ workflow:
 
 import (
 	"encoding/json"
-	"fmt"
+	"flag"
 	"io/ioutil"
 	"log"
+	"net"
 	"net/http"
+	"os"
+	"os/exec"
+	"runtime"
+	"strconv"
 	"strings"
 )
 
 var (
 	// global variable
-	breaker = NewBreaker()
+	breaker    = NewBreaker()
+	adminPort  = flag.String("adminPort", ":12345", "admin listen at")
+	proxyPort  = flag.String("proxyPort", ":23456", "proxy listen at")
+	configPath = flag.String("configPath", "", "config file path")
+	child      = flag.Bool("child", false, "is child process")
 )
 
 // APP registration infomation
@@ -51,31 +60,28 @@ func overrideAPP(breaker *Breaker, app APP) {
 	breaker.balancers[app.Name] = NewWRR(app.Backends...)
 }
 
-func createAPPHandler(w http.ResponseWriter, r *http.Request, _ Params) {
+func loadConfiguration() {
 	var app APP
 	var err error
 
-	body, err := ioutil.ReadAll(r.Body)
+	if *configPath == "" {
+		log.Panicf("configPath not set! got: %s", *configPath)
+	}
+	log.Printf("gonna using config: %s", *configPath)
+
+	body, err := ioutil.ReadFile(*configPath)
 	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte("failed" + err.Error()))
-		return
+		log.Panicf("failed to read config file: %s", err)
 	}
 	if err = json.Unmarshal(body, &app); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte("failed" + err.Error()))
-		return
+		log.Panicf("failed to load config : %s", err)
 	}
 	if len(app.Methods) != len(app.URLs) {
-		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte("failed: methods and urls should have same length and 1:1"))
-		return
+		log.Panicf("failed: methods and urls should have same length and 1:1")
 	}
 
 	log.Printf("gonna insert or over write app %s's configuration", app.Name)
 	overrideAPP(breaker, app)
-
-	fmt.Fprintf(w, "success!")
 }
 
 func inspectAPPHandler(w http.ResponseWriter, r *http.Request, ps Params) {
@@ -109,15 +115,69 @@ func inspectAPPHandler(w http.ResponseWriter, r *http.Request, ps Params) {
 	w.Write(jsonBytes)
 }
 
-func proxy() {
-	log.Fatal(http.ListenAndServe(":23456", breaker))
+func proxy(proxyLn net.Listener) {
+	log.Fatal(http.Serve(proxyLn, breaker))
+}
+
+// https://jiajunhuang.com/articles/2017_10_25-golang_graceful_restart.md.html
+func forkAndRun(proxyLn net.Listener, adminLn net.Listener, cpuSeq int) {
+	pl := proxyLn.(*net.TCPListener)
+	plFile, _ := pl.File()
+	al := adminLn.(*net.TCPListener)
+	alFile, _ := al.File()
+
+	cmd := exec.Command(
+		"taskset",
+		"-c",
+		strconv.Itoa(cpuSeq),
+		os.Args[0],
+		"-adminPort="+*adminPort,
+		"-proxyPort="+*proxyPort,
+		"-child=true",
+		"-configPath="+*configPath,
+	)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	cmd.ExtraFiles = []*os.File{plFile, alFile}
+	cmd.Run()
 }
 
 func main() {
+	flag.Parse()
+
+	loadConfiguration()
+
+	var proxyLn, adminLn net.Listener
+	var err error
+
+	if !*child {
+		proxyLn, err = net.Listen("tcp", *proxyPort)
+		if err != nil {
+			log.Panicf("failed to listen for proxy: %s", err)
+		}
+		adminLn, err = net.Listen("tcp", *adminPort)
+		if err != nil {
+			log.Panicf("failed to listen for admin: %s", err)
+		}
+
+		for i := 0; i < runtime.NumCPU(); i++ {
+			go forkAndRun(proxyLn, adminLn, i)
+		}
+	} else {
+		proxyLn, err = net.FileListener(os.NewFile(3, "proxy fd"))
+		if err != nil {
+			log.Panicf("failed to listen for proxy: %s", err)
+		}
+		adminLn, err = net.FileListener(os.NewFile(4, "admin fd"))
+		if err != nil {
+			log.Panicf("failed to listen for admin: %s", err)
+		}
+	}
+
+	runtime.GOMAXPROCS(2)
+
 	router := NewRouter()
-	router.POST("/app", createAPPHandler)
 	router.GET("/inspect/:app", inspectAPPHandler)
 
-	go proxy()
-	log.Fatal(http.ListenAndServe(":12345", router))
+	go proxy(proxyLn)
+	log.Fatal(http.Serve(adminLn, router))
 }
